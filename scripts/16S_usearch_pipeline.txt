@@ -1,0 +1,109 @@
+for eachS in `cat ./sample.list`
+do
+    echo $eachS
+#    mv ./rawdata/$eachS\_*R1_001.fastq.gz ./rawdata/$eachS\_R1.fastq.gz
+#    mv ./rawdata/$eachS\_*R2_001.fastq.gz ./rawdata/$eachS\_R2.fastq.gz
+#    gunzip ./rawdata/$eachS\_R1.fastq.gz ./rawdata/$eachS\_R2.fastq.gz
+    gzip ./rawdata/$eachS\_R1.fastq &
+    gzip ./rawdata/$eachS\_R2.fastq &
+done
+wait
+
+#rename reads
+for READ1 in *_R1_001.fastq; do mv "$READ1" "${READ1/%_R1_001.fastq/_R1.fastq}"; done
+
+for READ2 in *_R2_001.fastq; do mv "$READ2" "${READ2/%_R2_001.fastq/_R2.fastq}"; done
+
+#####Need to do usearch on ec2 Diego_master
+
+#####Remove all _ character from file names
+for file in *; do mv "${file}" "${file/_/}"; done
+
+#mkdir -p output
+./usearch11.0.667_i86linux32 -fastq_mergepairs rawdata/*_R1.fastq -relabel @ -fastqout ./output/merged.fq
+
+./usearch11.0.667_i86linux32 -fastq_filter ./output/merged.fq -fastq_maxee 1.0 -fastq_minlen 240 -relabel Filt -fastaout ./output/filtered.fa
+
+./usearch11.0.667_i86linux32 -fastx_uniques ./output/filtered.fa -sizeout -relabel Uniq -fastaout ./output/uniques.fa
+
+./usearch11.0.667_i86linux32 -unoise3 ./output/uniques.fa -zotus ./output/zotus.fa
+sed -i 's/Zotu/Otu/g' ./output/zotus.fa
+
+./usearch11.0.667_i86linux32 -otutab ./output/merged.fq -zotus ./output/zotus.fa -otutabout ./output/otu_table_zotu.txt -threads 16
+
+./usearch11.0.667_i86linux32 -otutab Desktop/Wang_lab/data/amerindian_data/usearch_analysis/merged_reads/merged.fq -zotus Desktop/Wang_lab/data/amerindian_data/usearch_analysis/merged_reads/zotus.fa -otutabout Desktop/Wang_lab/data/amerindian_data/usearch_analysis/merged_reads/otu_table_zotu.txt -biomout Desktop/Wang_lab/data/amerindian_data/usearch_analysis/merged_reads/otu_table_zotu.biom -threads 16
+#rm -f ./output/merged.fq ./output/uniques.fa ./output/filtered.fa
+
+./usearch11.0.667_i86linux32 -sintax Desktop/Wang_lab/data/amerindian_data/usearch_analysis/merged_reads/zotus.fa -db /Users/DRG/Desktop/Wang_lab/data/amerindian_data/usearch_analysis/merged_reads/rdp_16s_v16.fa -strand both -tabbedout /Users/DRG/Desktop/Wang_lab/data/amerindian_data/usearch_analysis/merged_reads/otus_tax.txt -sintax_cutoff 0.8
+
+bash /Users/DRG/Desktop/Wang_lab/data/amerindian_data/usearch_analysis/convert_usearch_tax.sh /Users/DRG/Desktop/Wang_lab/data/amerindian_data/usearch_analysis/merged_reads/otus_tax.txt /Users/DRG/Desktop/Wang_lab/data/amerindian_data/usearch_analysis/merged_reads/otus_tax_modified.txt
+
+./Desktop/Wang_lab/data/amerindian_data/bin/usearch11.0.667_i86osx32 -sintax_summary /Users/DRG/Desktop/Wang_lab/data/amerindian_data/usearch_analysis/merged_reads/otus_tax.txt -otutabin /Users/DRG/Desktop/Wang_lab/data/amerindian_data/usearch_analysis/merged_reads/otu_table_zotu.txt -rank g -output Desktop/Wang_lab/data/amerindian_data/usearch_analysis/merged_reads/genus_summary.txt
+
+
+###Visualize in R
+count_tab <- read.table("~/Desktop/Wang_lab/data/amerindian_data/usearch_analysis/merged_reads/otu_table_zotu.v2.txt", header=T, row.names=1, check.names=F)
+##optional: if many zeros in table can add artificial number:
+count_tab_2 <- count_tab_1+1
+bash /Users/DRG/Desktop/Wang_lab/data/amerindian_data/usearch_analysis/convert_usearch_tax.sh /Users/DRG/Desktop/Wang_lab/data/amerindian_data/usearch_analysis/merged_reads/otus_tax.txt /Users/DRG/Desktop/Wang_lab/data/amerindian_data/usearch_analysis/merged_reads/otus_tax_modified.txt
+tax_tab <- as.matrix(read.table("~/Desktop/Wang_lab/data/amerindian_data/usearch_analysis/merged_reads/otus_tax.txt", header=F, row.names=1, check.names=F, na.strings=" ", sep="\t"))
+sample_info_tab <- read.table("~/Desktop/Wang_lab/data/amerindian_data/usearch_analysis/merged_reads/sample_info.txt", header=T, row.names=1, check.names=F)
+
+In R:
+library(dendextend)
+library(DESeq2)
+
+##Beta diversity
+deseq_counts <- DESeqDataSetFromMatrix(count_tab, colData = sample_info_tab, design = ~Type)
+deseq_counts_vst <- varianceStabilizingTransformation(deseq_counts)
+vst_trans_count_tab <- assay(deseq_counts_vst)
+euc_dist <- dist(t(vst_trans_count_tab))
+
+##Hierarchical clustering
+euc_clust <- hclust(euc_dist, method="ward.D2")
+euc_dend <- as.dendrogram(euc_clust, hang=0.1)
+dend_cols <- as.character(sample_info_tab$color[order.dendrogram(euc_dend)])
+labels_colors(euc_dend) <- dend_cols
+plot(euc_dend, ylab="VST Euc. dist.")
+
+##PCoA
+vst_count_phy <- otu_table(vst_trans_count_tab, taxa_are_rows=T)
+sample_info_tab_phy <- sample_data(sample_info_tab)
+vst_physeq <- phyloseq(vst_count_phy, sample_info_tab_phy)
+
+vst_pcoa <- ordinate(vst_physeq, method="MDS", distance="euclidean")
+eigen_vals <- vst_pcoa$values$Eigenvalues
+
+##no labels
+plot_ordination(vst_physeq, vst_pcoa, color="char") + 
+geom_point(size=2) + labs(col="type") + 
+coord_fixed(sqrt(eigen_vals[2]/eigen_vals[1])) + ggtitle("PCoA") + 
+scale_color_manual(values=unique(sample_info_tab$color[order(sample_info_tab$char)])) + 
+theme(legend.position="none") + theme_bw()
+
+##labels
+plot_ordination(vst_physeq, vst_pcoa, color="char") + 
+geom_point(size=2) + labs(col="type") + 
+geom_text(aes(label=rownames(sample_info_tab), hjust=0.3, vjust=-0.4),size=2) + 
+coord_fixed(sqrt(eigen_vals[2]/eigen_vals[1])) + ggtitle("PCoA") + 
+scale_color_manual(values=unique(sample_info_tab$color[order(sample_info_tab$char)])) + 
+theme(legend.position="none") + theme_bw()
+
+##alpha diversity
+rarecurve(t(count_tab), step=100, col=sample_info_tab$color, lwd=2, ylab="ASVs", label=F)
+abline(v=(min(rowSums(t(count_tab))))) # and adding a vertical line at the fewest seqs in any sample
+
+##Richness and diversity estimates
+count_tab_phy <- otu_table(count_tab, taxa_are_rows=T)
+tax_tab_phy <- tax_table(tax_tab)
+
+ASV_physeq <- phyloseq(count_tab_phy, tax_tab_phy, sample_info_tab_phy)
+
+plot_richness(ASV_physeq, color="char", measures=c("Chao1", "Shannon")) + 
+  scale_color_manual(values=unique(sample_info_tab$color[order(sample_info_tab$char)])) + theme_bw() + theme(legend.title = element_blank(), axis.text.x=element_text(angle=90,hjust=1))
+
+plot_richness(ASV_physeq, x="Type", color="char", measures=c("Chao1", "Shannon")) + scale_color_manual(values=unique(sample_info_tab$color[order(sample_info_tab$char)])) + theme_bw() + theme(legend.title = element_blank(), axis.text.x=element_text(angle=90,hjust=1))
+
+###taxonomy bar plots
+qiime tools import --input-path /Users/DRG/Desktop/Wang_lab/data/amerindian_data/usearch_analysis/merged_reads/otu_table_zotu_try2.biom --type 'FeatureTable[Frequency]' --input-format BIOMV100Format --output-path /Users/DRG/Desktop/Wang_lab/data/amerindian_data/usearch_analysis/merged_reads/otu_table_zotu_try2.qza
+

@@ -1,0 +1,739 @@
+---
+title: "Charlie_16S"
+output: html_document
+date: "2023-03-03"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+setwd("~/Dropbox/Charlie_16S/scripts/")
+
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(wesanderson)
+library(ggthemes)
+library(reshape2)
+library(cowplot)
+library(biomformat)
+
+```
+
+#OLD pipeline
+OTU_reads <- read_biom("../processed_data/feature-table_Silva.biom")
+metadata <- read.csv("../ref/metadata.csv")
+
+zotu <- as.data.frame(as.matrix(biom_data(OTU_reads))) %>%
+  cbind(., OTU=paste('OTU',1:length(.$G0046), sep = '')) #%>% #randomly number OTUs
+  melt() %>% 
+  transform(sample = as.character(variable)) %>%
+  select(-variable) %>% rename('value'='counts') %>%
+  left_join(., metadata) %>% group_by(sample) %>% 
+  mutate(relabd = counts/sum(counts), log10relabd = log10(relabd)) %>%
+  mutate(log10relabd = if_else(relabd == 0, -6, log10(relabd))) %>% ungroup()
+
+#identify OTUs with  > 0.5% abundance in at least one sample
+otus.to.keep <- zotu %>%
+  group_by(OTU) %>%
+  summarise(max_abd = max(relabd)) %>%
+  filter(max_abd > .001) %>%
+  select(OTU) %>% ungroup() %>%
+  as_vector() 
+
+#drop samples with under 10K reads...
+# Pull out samples w/ >10k reads
+samples.to.keep <- zotu %>%
+  group_by(sample) %>% mutate(numreads = sum(counts)) %>% 
+  ungroup() %>%
+  filter(numreads > 10000) %>%
+  select(sample) %>% distinct() %>%
+  as_vector()
+ 
+# Drop OTUs not at least 0.5% abd in any sample or samples under 10k
+zotu <- zotu %>%
+  filter(OTU %in% otus.to.keep) %>%
+  filter(sample %in% samples.to.keep)
+
+#get taxonomy
+tax_table <- as.data.frame(as.matrix(biom_data(OTU_reads))) %>%
+  cbind(., OTU=paste('OTU',1:length(.$G0046), sep = '')) %>% mutate(tax_info = row.names(.)) %>% select(OTU, tax_info) %>% 
+  separate(tax_info, into = c('x','Kingdom', 'Phylum', 'Class', 'Order', 'Family', 'Genus'), sep = '__') %>% 
+        mutate(Kingdom = gsub("\\;[alpha]*","",.$Kingdom),
+               Phylum = gsub(";c","",.$Phylum),
+               Class = gsub(";o","",.$Class),
+               Order = gsub(";f","",.$Order),
+               Family = gsub(";g","",.$Family),
+               Genus = gsub(";","",.$Genus)) %>% select(-x)
+
+#remove those blasted semicolons!
+tax_table[] <- lapply(tax_table, gsub, pattern=';', replacement='')
+
+zotu <- left_join(zotu, tax_table)
+
+
+
+USearch pipeline to identify OTUs and assign taxonomy
+```{r}
+
+
+zotu <- read_csv("../processed_data/zotu.csv") 
+tax <- read_csv("../processed_data/tax.csv") 
+meta <- read_csv("../ref/metadata.csv")
+
+# Check read counts
+read.counts <- zotu %>%
+  rowwise(seqid) %>%
+  mutate(numreads = rowSums(across(where(is.numeric)))) %>%
+  ungroup() %>%
+  select(seqid, numreads)
+
+#tested <- c("G0046", 'G1168', 'G1179', 'G0872', 'G1203', 'G0097', 'G0660', 'G0984', 'G0980', 'G1196', 'G0708', 'G1218', '1190')
+
+# Pull out samples w/ >10k reads
+samples.to.keep <- read.counts %>%
+  filter(numreads > 1000) %>%
+  select(seqid) %>%# filter(seqid %in% tested) %>%
+  as_vector()
+
+
+# Drop <10k read samples from zotu table
+zotu <- zotu %>%
+  filter(seqid %in% samples.to.keep)
+
+# make tidy data
+# Convert to relative abundance
+zotu <- zotu %>%
+  pivot_longer(!seqid, names_to="OTU", values_to="reads") %>%
+  group_by(seqid) %>%
+  mutate(relabd = (reads / sum(reads))) %>% ungroup
+
+
+# calc log10 OTU abd
+zotu <- zotu %>%
+  mutate(log10relabd = if_else(relabd == 0, -6, log10(relabd)))
+
+#filter out otus
+otus.to.keep <- zotu %>%
+  group_by(OTU) %>%
+  summarise(avg_abd = mean(relabd)) %>%
+  filter(avg_abd > .001) %>%
+  select(OTU) %>%
+  as_vector()
+
+zotu <- zotu %>%
+  filter(OTU %in% otus.to.keep)
+
+# Join metadata to zotu table
+zotu <- zotu %>%
+  left_join(., meta, by= c("seqid"="sample")) %>% dplyr::rename("sample"="seqid")
+
+#now add taxa
+gtable <- tax %>%
+  select(OTU, genus, family)
+
+zotu <- zotu %>%
+  left_join(gtable, by="OTU")
+```
+
+
+Heatmap of all samples
+```{r}
+
+library('ggdendro')
+library('grid')
+
+
+humanized <- zotu %>% select(OTU, sample, log10relabd) %>% 
+              distinct() %>% reshape2::dcast(OTU~sample)
+
+humanized.scaled <- humanized
+
+#clustering
+set.seed(123)
+humanized.matrix <- as.matrix(humanized.scaled[, -c(1)])
+rownames(humanized.matrix) <- humanized.scaled$OTU
+humanized.dendro <- as.dendrogram(hclust(d = dist(x = humanized.matrix)))
+
+# Create dendro
+dendro.plot <- ggdendrogram(data = humanized.dendro, rotate = TRUE)
+dendro.OTU <- dendro.plot
+
+#reorder
+humanized.order <- order.dendrogram(humanized.dendro)
+zotu$OTU <- factor(x = zotu$OTU,
+                               levels = humanized.scaled$OTU[humanized.order], 
+                               ordered = TRUE)
+
+
+#now reorder X axis
+humanized <- zotu %>% select(OTU, sample, log10relabd) %>% 
+              distinct() %>% reshape2::dcast(sample~OTU)
+#clustering
+set.seed(123)
+humanized.matrix <- as.matrix(humanized[, -c(1)])
+rownames(humanized.matrix) <- humanized$sample
+humanized.dendro <- as.dendrogram(hclust(d = dist(x = humanized.matrix)))
+
+# Create dendro
+dendro.plot <- ggdendrogram(data = humanized.dendro, rotate = TRUE)
+dendro.x <- dendro.plot
+
+#reorder
+humanized.order <- order.dendrogram(humanized.dendro)
+zotu$sample <- factor(x = zotu$sample,
+                               levels = humanized$sample[humanized.order], 
+                               ordered = TRUE)
+
+##GET BUG COLORS FROM BAR GRAPHS AT END
+#bugColors <- setNames(c(scales::hue_pal()(length(unique(zotu$family)))), c(levels(as.factor(zotu$family))))
+
+#fam lvl
+heatmap.plot <- zotu %>% 
+  ggplot(., aes(x=sample, y=OTU, fill=log10relabd)) +
+  geom_tile(color = 'white') +
+  scale_fill_gradient2(high = 'firebrick3', mid = 'white', low = '#1357a6', midpoint = -3) +
+  labs(x = 'Human Donor', y = 'OTU', fill = 'log10(Relative Abundance)') +
+  theme(strip.text.y.right = element_text(angle = 0, size = 10),
+        strip.text.x.top = element_text(angle = 0, size = 10),
+              axis.ticks = element_blank(), 
+              axis.text.x = element_text(size = 10, hjust = 1, angle = 90),
+              axis.text.y = element_blank(),
+              strip.text = element_text(size = 6),
+              panel.background = element_blank(), 
+              strip.background = element_blank(),
+              legend.position = 'bottom',
+              panel.spacing = unit(0.05, "lines"))
+heatmap.plot
+
+label <- ggplot(data = zotu, aes(x = sample, y = '')) +
+    geom_tile(aes(fill = group), color = 'white') + 
+    scale_fill_manual(values = c('firebrick', 'dodgerblue', 'forestgreen')) +
+    labs(fill = '') +
+    theme(strip.text.y.right = element_text(angle = 0),
+              panel.background = element_blank(), 
+              axis.ticks = element_blank(), 
+              axis.text.y = element_blank(),
+              axis.title.y = element_blank(),
+              axis.text.x = element_blank(), 
+              axis.title.x = element_blank(),
+              strip.text = element_blank(),
+              panel.spacing = unit(0.05, "lines"))
+
+family <-  zotu %>% mutate(family = ifelse(family %in% top10, family, 'Other')) %>%
+    ggplot(., aes(x = '', y = OTU)) +
+    geom_tile(aes(fill = family), color = 'white') + 
+    scale_fill_manual(values = bugColors) +
+    labs(fill = 'family') +
+    theme(strip.text.y.right = element_text(angle = 0),
+              panel.background = element_blank(), 
+              axis.ticks = element_blank(), 
+              axis.text.y = element_blank(),
+              axis.title.y = element_blank(),
+              axis.text.x = element_blank(), 
+              axis.title.x = element_blank(),
+              strip.text = element_blank(),
+              panel.spacing = unit(0.05, "lines"))
+family
+
+dendro <- plot_grid(dendro.OTU, dendro.x)
+dendro
+ggsave("../figs/dendrogram.png",  width = 6 , height = 6)
+ggsave("../figs/dendrogram.pdf",  width = 6, height = 6)
+
+cowplot::plot_grid(heatmap.plot, family, label, ncol =3, rel_widths = c(.2,.3, .2))
+ggsave("../figs/heatmap.png",  width = 14, height = 6)
+ggsave("../figs/heatmap.pdf",  width = 14, height = 6)
+
+```
+
+PCA of samples
+```{r}
+
+library(M3C)
+
+vendor <- zotu %>% 
+  select(OTU, sample,group, relabd) %>% 
+  reshape2::dcast(., group + sample ~ OTU) 
+
+set.seed(123)
+
+
+humanized.matrix <- as.matrix(humanized[, -c(1)])
+
+
+#create such that samples as columns, rows as features
+tSNE_header <- (vendor %>% select(-sample) %>% t() %>% as.data.frame())[1,]
+
+
+tSNE_input <- (vendor %>% select(-sample) %>% t() %>% as.data.frame())[-1,] %>% 
+              mutate_all(., function(x) as.numeric(as.character(x))) 
+
+names(tSNE_input) <- tSNE_header[1,]
+
+
+s9c <- M3C::pca(tSNE_input, 
+         labels = as.factor(names(tSNE_input)),
+         colvec = c('firebrick', 'dodgerblue', 'forestgreen'),
+         dotsize = 3,
+         controlscale = T, scale = 3, 
+         axistextsize = 10,
+         legendtextsize = 14, legendtitle = '')
+plotly::ggplotly(s9c)
+
+ggsave("../figs/PCA_Charlie.png", width = 4, height = 3)
+ggsave("../figs/PCA_Charlie.pdf", width = 4, height = 3)
+
+```
+
+How is diversity?
+```{r}
+
+library(vegan)
+
+tSNE_header <- (vendor %>% select(-group) %>% t() %>% as.data.frame())[1,]
+
+sd_df<- tSNE_input %>% t() %>% vegan::diversity(index = "shannon")
+
+sd_lab <- tSNE_header %>% t()
+grp_key <- vendor[,1:2]
+
+shannonD <- sd_df %>% as.data.frame() %>% cbind(., sd_lab) %>% select(shannD = '.', sample)
+
+#normalize by log(k) where k is number of species over 0.05
+numk <- zotu %>% 
+  select(OTU, sample, relabd) %>% 
+  melt(id.vars = c('sample', 'OTU')) %>% 
+  filter(value > .001) %>% 
+  select(-value) %>% distinct() %>% 
+  group_by(sample) %>% mutate(kval = log2(n())) %>%
+  ungroup() %>% select(sample, kval) %>% distinct() %>% na.omit()
+
+shannonD <- left_join(shannonD, numk) %>% mutate(shann_entropy = shannD/kval) %>% left_join(.,grp_key)
+
+#IF ONLY DOING SHANNON DIVERSITY
+#shannonD <- left_join(shannonD, numk) %>% left_join(.,grp_key)
+
+
+ggplot(shannonD, aes(factor(group, levels = c("H", "AR", "GC")), 
+                     shann_entropy), fill = 'white') +
+    stat_boxplot(geom= 'errorbar', width = .2, lwd = .5) +
+    geom_boxplot(outlier.shape = NA, lwd = .5) + 
+    geom_jitter(size = 2) +
+  labs(y = 'Normalized Shannon Entropy', x = 'Disease Group') +
+  theme_cowplot() +
+  ggsignif::geom_signif(comparisons = list(c("AR","H"),c("H","GC"),c("AR","GC")), 
+                         y_position = c(0.63, .605, .615),
+                         map_signif_level=TRUE, #Comment out for p-values
+                         test = "wilcox.test") +
+  theme(axis.text.x = element_text(size = 14), 
+  axis.text.y = element_text(size = 14),
+axis.title.x.bottom = element_text(size = 16),
+axis.title.y.left = element_text(size = 16),
+legend.position = 'none')
+
+ggsave("../figs/Entropy_Charlie.png", width = 2, height = 3.5)
+ggsave("../figs/Entropy_Charlie.pdf", width = 2, height = 3.5)
+
+```
+
+
+Also do richness (alpha-diversity)
+```{r}
+
+chao <- zotu %>% 
+  select(OTU, sample,group, reads) %>% 
+  reshape2::dcast(., group + sample ~ OTU) 
+
+set.seed(123)
+
+
+#create such that samples as columns, rows as features
+tSNE_header <- (chao %>% #select(-sample) %>% 
+                  t() %>% as.data.frame())[1:2,] %>% t()
+
+
+tSNE_input <- (chao %>% select(-sample) %>% t() %>% as.data.frame())[-1,] %>% 
+              mutate_all(., function(x) as.numeric(as.character(x))) 
+
+
+# calculate richness and Chao1 using vegan package
+sd_df <- tSNE_input %>% t() %>% vegan::estimateR(.)
+
+shannonD <- sd_df %>% as.data.frame() %>% t() %>% cbind(., tSNE_header) %>% as.data.frame()
+shannonD[1:5] <- sapply(shannonD[1:5],as.numeric)
+
+#wilcox.test(filter(shannonD, group == 'GC')$S.chao1, filter(shannonD, group == 'H')$S.chao1)
+
+ggplot(shannonD, aes(factor(group, levels = c("H","AR", "GC")), 
+                     S.chao1), fill = 'white') +
+    stat_boxplot(geom= 'errorbar', width = .2, lwd = .5) +
+    geom_boxplot(outlier.shape = NA, lwd = .5) + 
+    geom_jitter(size = 2) +
+  labs(y = 'Estimated Species Richness [chao1]', x = 'Disease Group') +
+  theme_cowplot() +
+  ggsignif::geom_signif(comparisons = list(c("AR","H"),c("H","GC"),c("AR","GC")), 
+                         y_position = c(123, 125.5, 128),
+    #                     map_signif_level=TRUE, #Comment out for p-values
+                         test = "wilcox.test") +
+  theme(axis.text.x = element_text(size = 14), 
+  axis.text.y = element_text(size = 14),
+axis.title.x.bottom = element_text(size = 16),
+axis.title.y.left = element_text(size = 16),
+legend.position = 'none')
+
+ggsave("../figs/Richness_Charlie.png", width = 2, height = 3.5)
+ggsave("../figs/Richness_Charlie.pdf", width = 2, height = 3.5)
+```
+
+
+Can we do DEseq to identify differentially abundant OTUs?
+
+
+```{r}
+
+library("DESeq2")
+
+#Make count matrix
+cts <- zotu %>% 
+        select(sample, reads, OTU) %>% 
+        dcast(OTU~sample, value.var = "reads") %>% 
+        column_to_rownames("OTU")
+
+#add pseudocounts
+cts[is.na(cts)] <- 0
+cts <-(cts + 1)
+
+#Generate MetaData 
+coldata <- cts %>% t() %>% as.data.frame %>% 
+      rownames_to_column("sample") %>% select(sample) %>%
+           left_join(., select(zotu, sample, group) %>% 
+                  distinct) %>% 
+       column_to_rownames("sample") 
+
+#Make sure dfs are correct
+all(rownames(coldata) %in% colnames(cts))
+all(rownames(coldata) == colnames(cts))
+
+
+```
+
+
+```{r}
+set.seed(123)
+#Make DeSeq DataSet
+dds <- DESeqDataSetFromMatrix(countData = cts,
+                              colData = coldata,
+                              design = ~ group)
+
+#Differential 'expression' analysis
+dds <- DESeq(dds)
+
+#Build result table for C vs A
+res_CvsA <- results(dds, contrast=c('group', "GC","AR"), 
+                      pAdjustMethod = 'BH')
+
+#Build result table for C vs B
+res_CvsB <- results(dds, contrast=c('group', "GC","H"), 
+                      pAdjustMethod = 'BH')
+
+#Build result table for A vs B
+res_AvsB <- results(dds, contrast=c('group', "AR","H"), 
+                      pAdjustMethod = 'BH')
+
+```
+
+
+Let's see those plots!!!
+```{r}
+
+
+## Obtain logical vector where TRUE values denote padj values < 0.05 and fold change > 2 in either direction
+res_table_CvsA <- res_CvsA %>% as.data.frame() %>%
+                      mutate(threshold = padj < 0.05 & abs(log2FoldChange) >= 1,
+                             OTUType = ifelse(log2FoldChange > 0 & threshold == T, 
+                                           "GC-enriched", NA),
+                             OTUType = ifelse(log2FoldChange < 0 & threshold == T,
+                                           "AR-enriched", OTUType)) %>% 
+                  tibble::rownames_to_column(., "OTU") %>% 
+                inner_join(., tax)
+
+res_table_CvsB <- res_CvsB %>% as.data.frame() %>%
+                      mutate(threshold = padj < 0.05 & abs(log2FoldChange) >= 1,
+                             OTUType = ifelse(log2FoldChange > 0 & threshold == T, 
+                                           "GC-enriched", NA),
+                             OTUType = ifelse(log2FoldChange < 0 & threshold == T,
+                                           "H-enriched", OTUType)) %>% 
+                  tibble::rownames_to_column(., "OTU") %>% 
+                inner_join(., tax)
+
+res_table_AvsB <- res_AvsB %>% as.data.frame() %>%
+                      mutate(threshold = padj < 0.05 & abs(log2FoldChange) >= 1,
+                             OTUType = ifelse(log2FoldChange > 0 & threshold == T, 
+                                           "AR-enriched", NA),
+                             OTUType = ifelse(log2FoldChange < 0 & threshold == T,
+                                           "H-enriched", OTUType)) %>% 
+                  tibble::rownames_to_column(., "OTU") %>% 
+                inner_join(., tax)
+                  
+## Volcano plot 
+volcano_A <- ggplot(res_table_CvsA) +
+    geom_point(aes(x = log2FoldChange, y = -log10(padj), color = OTUType),size = 2) +
+    #scale_color_manual(values = c('#6BBCD1','#FD9415' )) +
+    scale_color_manual(values = c('firebrick', 'dodgerblue')) +
+    ggtitle("AR vs GC") +
+    xlab("log2(Fold Change)") + 
+    ylab("-log10(adjusted p-value)") +
+    xlim(-12,12) +
+    ylim(0,10) +
+  theme_cowplot() +
+    theme(legend.position = "none",
+          plot.title = element_text(size = rel(1.5), hjust = 0.5),
+          axis.title = element_text(size = rel(1.25)))          
+
+plotly::ggplotly(volcano_A)
+
+volcano_B <- ggplot(res_table_CvsB) +
+    geom_point(aes(x = log2FoldChange, y = -log10(padj), color = OTUType),size = 2) +
+    #scale_color_manual(values = c('#6BBCD1','#FD9415' )) +
+    scale_color_manual(values = c('dodgerblue', 'forestgreen')) +
+    ggtitle("H vs GC") +
+    xlab("log2(Fold Change)") + 
+    ylab("-log10(adjusted p-value)") +
+    xlim(-11,11) +
+    ylim(0,10) +
+  theme_cowplot() +
+    theme(legend.position = "none",
+          plot.title = element_text(size = rel(1.5), hjust = 0.5),
+          axis.title = element_text(size = rel(1.25)))          
+
+plotly::ggplotly(volcano_B)
+
+
+volcano_c <- ggplot(res_table_AvsB) +
+    geom_point(aes(x = log2FoldChange, y = -log10(padj), color = OTUType),size = 2) +
+    #scale_color_manual(values = c('#6BBCD1','#FD9415' )) +
+    scale_color_manual(values = c('firebrick', 'forestgreen')) +
+    ggtitle("H vs AR") +
+    xlab("log2(Fold Change)") + 
+    ylab("-log10(adjusted p-value)") +
+    xlim(-11,11) +
+    ylim(0,10) +
+    theme_cowplot() +
+    theme(legend.position = "none",
+          plot.title = element_text(size = rel(1.5), hjust = 0.5),
+          axis.title = element_text(size = rel(1.25)))   
+
+
+plotly::ggplotly(volcano_c)
+
+
+plot_grid(volcano_A, volcano_B, volcano_c, nrow = 1)
+
+ggsave("../figs/DEseq_Charlie.png", width = 10.5, height = 3.5)
+ggsave("../figs/DEseq_Charlie.pdf", width = 10.5, height = 3.5)
+
+```
+
+```{r}
+
+
+fam_abd <- vendor %>% reshape2::melt() %>% group_by(group, variable) %>% 
+    mutate(median_relabd = median(value)) %>% select(-value, -sample) %>% ungroup %>% 
+  distinct() %>%
+  left_join(., tax, by = c('variable'='OTU')) %>%
+  select(family, group, median_relabd) %>% group_by(group, family) %>% 
+  mutate(ttl_fam = sum(median_relabd)) %>%
+  filter(ttl_fam > .0001) %>% select(-median_relabd) %>% ungroup %>% distinct() %>% 
+  mutate(family = ifelse(ttl_fam < .003, 'Other', family)) %>% group_by(family, group) %>% mutate(ttl_fam = sum(ttl_fam)) %>% ungroup() %>% distinct()
+
+set.seed(123)
+
+#Get top 10 families
+top10 <- c((fam_abd %>% group_by(family) %>% mutate(famcount=sum(ttl_fam)) %>% 
+  select(family, famcount) %>% distinct() %>% arrange(desc(famcount)))$family[1:10], 'Enterobacteriaceae', 'Bifidobacteriaceae')
+
+bugColors <- setNames(c(scales::hue_pal()(length(unique(top10)))), c(levels(
+  (sample(x = as.factor(top10),size = length(top10),replace = F))
+  )))
+
+bugColors <- bugColors[top10]
+
+
+plot <- fam_abd %>% mutate(family = ifelse(family %in% top10, family, 'Other')) %>% #only look at top 10 families
+  group_by(family, group) %>%
+  mutate(ttl_fam = sum(ttl_fam)) %>% ungroup %>% distinct() %>%
+  ggplot(., aes(x = factor(group, levels = c('H', 'AR', 'GC')), y=ttl_fam, fill = family),color = 'black') + 
+  geom_col(stat="identity", position = 'fill', width = .5) +
+  labs(x='', y = 'Rel. Abundance', fill = 'Family') +
+    scale_fill_manual(values = bugColors) +
+  theme_cowplot() +
+    theme(plot.background = element_blank(),
+          strip.background = element_blank(),
+          axis.title.y = element_text(size = 14),
+              axis.text.y = element_text(size = 12), 
+              axis.text.x = element_text(size = 12),
+              axis.ticks.x = element_blank(),
+              panel.spacing = unit(0.05, "lines"),
+          legend.text = element_text(size = 8),
+          legend.key.height  = unit(.35, 'cm'),
+          legend.key.width  = unit(.35, 'cm'))
+
+plotly::ggplotly(plot)
+#plot
+ggsave("../figs/16Scomposition.png", width = 3.5, height = 2.5)
+ggsave("../figs/16Scomposition.pdf", width = 3.5, height = 2.5)
+
+
+```
+
+Streptococcae and erysipelotrichacea seem enriched, is that legit?
+```{r}
+#Cool, streptococcae foound in A but not B... Why dat?
+
+#sig_OTUs <- (compare %>% filter(threshold == T)) %>% select(OTU)
+
+plota <- zotu %>% 
+  #filter(family == 'Streptococcaceae') %>% 
+  #filter(family == 'Ruminococcaceae') %>% 
+  filter(OTU == 'Otu9') %>%
+  #group_by(sample, OTU) %>% 
+  #mutate(ttl_strep = sum(relabd)) %>% ungroup() %>% 
+  select(sample, group, gender, relabd, OTU) %>% 
+  distinct() %>%
+  ggplot(., aes(group, relabd)) +
+  scale_y_log10() +
+  stat_boxplot(width = .1, geom ='errorbar') +
+  geom_boxplot(outlier.shape = NA, width = .5) + 
+  geom_jitter(aes(color = gender)) + 
+  ggsignif::geom_signif(comparisons = list(c("AR", "H"),c("AR","GC"),c("H","GC")), 
+                         y_position = c(-.5, -.2, -.8),
+                         map_signif_level=TRUE, #Comment out for p-valu es
+                         test = "wilcox.test") + 
+  theme_cowplot() +
+  labs(x='Group', y='Rel. Abd.', title = 'OTU9') +
+  theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14), strip.background = element_blank()) 
+
+plota
+
+ggsave("../figs/OTU9_Enrichment.pdf", width = 3.5, height = 3.5)
+
+#plotly::ggplotly(plota)
+#lefse analysis
+```
+
+```{r}
+fam <- 'Streptococcaceae'
+
+plota <- zotu %>% 
+  filter(family == fam) %>% 
+  group_by(sample) %>% 
+  mutate(ttl_strep = log10(mean(relabd))) %>% ungroup() %>% 
+  select(group, ttl_strep) %>% 
+  distinct() %>%
+  ggplot(., aes(factor(group, levels = c("H", "AR", "GC")), ttl_strep)) +
+  stat_boxplot(width = .1, geom ='errorbar') +
+  geom_boxplot(outlier.shape = NA, width = .5) + 
+  geom_jitter() + 
+  ggsignif::geom_signif(comparisons = list(c("AR", "H"),c("AR","GC"),c("H","GC")), 
+                         y_position = c(-1.2, -1, -.75),
+                         map_signif_level=TRUE, #Comment out for p-valu es
+                         test = "wilcox.test") + 
+  theme_cowplot() +
+  labs(x='Cohort', y='log10(Rel. Abd.)', title = fam) +
+  theme(axis.text = element_text(size = 14),
+        axis.title = element_text(size = 14), strip.background = element_blank())
+plota 
+
+fam <- 'Bifidobacteriaceae'
+
+plotb <- zotu %>% 
+  filter(family == fam) %>% 
+  group_by(sample) %>% 
+  mutate(ttl_strep = log10(mean(relabd))) %>% ungroup() %>% 
+  select(group, ttl_strep) %>% 
+  distinct() %>%
+  ggplot(., aes(factor(group, levels = c("H", "AR", "GC")), ttl_strep)) +
+  stat_boxplot(width = .1, geom ='errorbar') +
+  geom_boxplot(outlier.shape = NA, width = .5) + 
+  geom_jitter() + 
+  ggsignif::geom_signif(comparisons = list(c("AR", "H"),c("AR","GC"),c("H","GC")), 
+                         y_position = c(-1.2, -1, -.75),
+                         map_signif_level=TRUE, #Comment out for p-valu es
+                         test = "wilcox.test") + 
+  theme_cowplot() +
+  labs(x='Cohort', y='log10(Rel. Abd.)', title = fam) +
+  theme(axis.text = element_text(size = 14),
+        axis.title = element_text(size = 14), strip.background = element_blank())
+
+plotb
+
+fam <- 'Enterobacteriaceae'
+
+plotc <- zotu %>% 
+  filter(family == fam) %>% 
+  group_by(sample) %>% 
+  mutate(ttl_strep = log10(mean(relabd))) %>% ungroup() %>% 
+  select(group, ttl_strep) %>% 
+  distinct() %>%
+  ggplot(., aes(factor(group, levels = c("H", "AR", "GC")), ttl_strep)) +
+  stat_boxplot(width = .1, geom ='errorbar') +
+  geom_boxplot(outlier.shape = NA, width = .5) + 
+  geom_jitter() + 
+  ggsignif::geom_signif(comparisons = list(c("AR", "H"),c("AR","GC"),c("H","GC")), 
+                         y_position = c(-1.2, -1, -.75),
+                         map_signif_level=TRUE, #Comment out for p-valu es
+                         test = "wilcox.test") + 
+  theme_cowplot() +
+  labs(x='Cohort', y='log10(Rel. Abd.)', title = fam) +
+  theme(axis.text = element_text(size = 14),
+        axis.title = element_text(size = 14), strip.background = element_blank())
+
+plotc
+
+plot_grid(plota, plotb, plotc, rel_widths = c(1,1,1), nrow = 1)
+
+ggsave("../figs/FamilyEnrichments.png", width = 9, height = 4)
+ggsave("../figs/FamilyEnrichments.pdf", width = 9, height = 4)
+
+plota
+ggsave("../figs/StrepEnrichments.png", width = 2.5, height = 4)
+ggsave("../figs/StrepEnrichments.pdf", width = 2.5, height = 4)
+
+```
+
+Can also look at phylum, but not really that different
+```{}
+phy_abd <- vendor %>% reshape2::melt() %>% group_by(group, variable) %>% 
+    mutate(median_relabd = median(value)) %>% select(-value, -sample) %>% ungroup %>% 
+  distinct() %>%
+  left_join(., tax_table, by = c('variable'='OTU')) %>%
+  select(Phylum, group, median_relabd) %>% group_by(group, Phylum) %>% mutate(ttl_fam = sum(median_relabd)) %>% select(-median_relabd) %>% ungroup %>% distinct()
+
+
+
+
+
+
+plotb <- ggplot(phy_abd, aes(x = group, y=ttl_fam, fill = Phylum)) + 
+  geom_col(stat="identity", position = 'fill', width = .5) +
+  #geom_col(stat="identity", position = 'stack') +
+  labs(x='', y = 'Rel. Abundance', fill = 'Phylum') +
+  #  scale_fill_manual(values = bugColors) +
+  theme_cowplot() +
+    theme(plot.background = element_blank(),
+          strip.background = element_blank(),
+          axis.title.y = element_text(size = 14),
+              axis.text.y = element_text(size = 12), 
+              axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+              axis.ticks.x = element_blank(),
+              panel.spacing = unit(0.05, "lines"),
+          legend.text = element_text(size = 8),
+          legend.key.height  = unit(.35, 'cm'),
+          legend.key.width  = unit(.35, 'cm'))
+
+cowplot::plot_grid(plot,  plotb)
+
+```
+
